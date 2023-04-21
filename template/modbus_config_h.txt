@@ -1,10 +1,25 @@
 #ifndef INCLUDE_MODBUS_CONFIG_H_
 #define INCLUDE_MODBUS_CONFIG_H_
 
-//#define MODBUS_STM32F0
-#define MODBUS_PLATFORM_TMS320F2806x
+//#define MODBUS_PLATFORM_STM32F0
+#define MODBUS_PLATFORM_STM32F3
+//#define MODBUS_PLATFORM_TMS320F2806x
 //#define MODBUS_PLATFORM_TMS320F2837x
 //#define MODBUS_FREERTOS
+
+/*
+ * Define MODBUS_TIMESTAMP to use the timestamp implementation
+ * comes with this library, otherwise one needs to implement
+ * timestamp_get(), see "timestamp.h".
+ */
+#define MODBUS_TIMESTAMP
+
+/*
+ * Convert number of Systick cycle to nearest microseconds.
+ * Required if MODBUS_TIMESTAMP is defined.
+ */
+// 64ticks per us in this case
+#define TIMESTAMP_TICK2US(systick) (systick>>6)
 
 #define RX_BUFLEN_BYTE 255
 #define TX_BUFLEN_BYTE 255
