@@ -1,17 +1,8 @@
-#ifndef MODBUS_H_
-#define MODBUS_H_
+#ifndef MODBUS_STM32F0_H_
+#define MODBUS_STM32F0_H_
 
 #include <stdint.h>
 #include "modbus_common.h"
-
-// GPIO
-#define RS485_DE_HIGH() GPIOF->BSRR = LL_GPIO_PIN_0
-#define RS485_DE_LOW()  GPIOF->BRR = LL_GPIO_PIN_0
-#define RS485_PV_HIGH() GPIOF->BSRR = LL_GPIO_PIN_1
-#define RS485_PV_LOW()  GPIOF->BRR = LL_GPIO_PIN_1
-
-// Configure the baud rate
-#define MODBUS_BAUD 115200
 
 #define UART_BUFLEN 255
 #define MODBUS_PDU_MAXLEN 252
@@ -30,4 +21,4 @@ void modbus_freertos_init(void);
 void modbus_task(void);
 #endif
 
-#endif /* MODBUS_H_ */
+#endif /* MODBUS_STM32_H_ */

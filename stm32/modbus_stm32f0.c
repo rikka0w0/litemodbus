@@ -1,8 +1,9 @@
 #include "modbus_config.h"
-#ifdef MODBUS_STM32F0
+#ifdef MODBUS_PLATFORM_STM32F0
+#include "modbus_protocol.h"
 #include "modbus_stm32f0.h"
 
-#if MODBUS_FREERTOS
+#ifdef MODBUS_FREERTOS
 #include <limits.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -21,20 +22,25 @@
 
 static uint8_t modbus_addr;
 
-static volatile uint32_t uart_rx_len;           // The length without CRC16
-volatile uint8_t uart_rx_buf[UART_BUFLEN];      // Populated by DMA
+static uint32_t uart_rx_len;           // The length with CRC16
+uint8_t uart_rx_buf[UART_BUFLEN];      // Populated by DMA
 
-static volatile uint32_t uart_tx_len;
-volatile uint8_t uart_tx_buf[UART_BUFLEN];      // Consumed by DMA
+static uint32_t uart_tx_len;           // The length with CRC16
+uint8_t uart_tx_buf[UART_BUFLEN];      // Consumed by DMA
 
 // Modbus State Machine
 enum modbus_pending_tasks {
     modbus_no_pending = 0,
     modbus_enable_rx = 1,
-    modbus_send_txbuf = 2
+    modbus_check_crc = 2
+
+#ifndef MODBUS_FREERTOS
+    ,
+    modbus_send_txbuf = 3
+#endif
 };
 
-#if(MODBUS_FREERTOS)
+#ifdef MODBUS_FREERTOS
 // number of words allocated to the modbus task
 #define MODBUS_STACK_SIZE 128
 #define MODBUS_TASK_PRIORITY (configMAX_PRIORITIES-2)
@@ -104,7 +110,7 @@ uint16_t modbus_crc16(const uint8_t *data, uint32_t dat_len)
  * The Interrupt Handler for USART1
  */
 void USART1_IRQHandler(void) {
-#if(MODBUS_FREERTOS)
+#ifdef MODBUS_FREERTOS
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 #endif
 
@@ -117,43 +123,25 @@ void USART1_IRQHandler(void) {
         LL_USART_DisableDirectionRx(USART1);
         LL_DMA_DisableChannel(DMA1, LL_DMA_CHANNEL_3);
 
-#if(!MODBUS_FREERTOS)
+#ifndef MODBUS_FREERTOS
         modbus_last_frame_timestamp = timestamp_get();
 #endif
 
         uint32_t rx_len = UART_BUFLEN - LL_DMA_GetDataLength(DMA1, LL_DMA_CHANNEL_3);
-        // Discard invalid message (too short)
-        if (rx_len > 4) {
-            // Discard the message if we are not the recipient
-            if (uart_rx_buf[0] == modbus_addr || uart_rx_buf[0] == 0) {
-                rx_len -= 2;
-                uint16_t crc16_calc = modbus_crc16((uint8_t*) uart_rx_buf, rx_len);
-                uint16_t crc16_recv = uart_rx_buf[rx_len+1];
-                crc16_recv <<= 8;
-                crc16_recv |= uart_rx_buf[rx_len];
-
-                // Check CRC
-                if (crc16_calc == crc16_recv) {
-                    uart_rx_len = rx_len;
-
-#if(MODBUS_FREERTOS)
-                    xTaskNotifyFromISR(modbus_rtostask, modbus_send_txbuf, eSetValueWithOverwrite, &xHigherPriorityTaskWoken);
-                    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+        // Discard invalid message (too short) or if we are not the recipient
+        if (rx_len > 5 && (uart_rx_buf[0] == modbus_addr || uart_rx_buf[0] == 0)) {
+            uart_rx_len = rx_len;
+#ifdef MODBUS_FREERTOS
+            xTaskNotifyFromISR(modbus_rtostask, modbus_check_crc, eSetValueWithOverwrite, &xHigherPriorityTaskWoken);
 #endif
-
-                    // Return so that we will not resume listening immediately
-                    return;
-                }
-            }
-        }
-
-        // Resume listening if we don't need to process the message
-#if(MODBUS_FREERTOS)
+        } else {
+            // Resume listening if we don't need to process the message
+#ifdef MODBUS_FREERTOS
         xTaskNotifyFromISR(modbus_rtostask, modbus_enable_rx, eSetValueWithOverwrite, &xHigherPriorityTaskWoken);
-        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 #else
         modbus_schedule_task(modbus_enable_rx, MODBUS_INTERFRAME_GAP);
 #endif
+        }
     } else if (USART1->ISR & USART_ISR_TC) {
         // Transmission completed
 
@@ -167,14 +155,16 @@ void USART1_IRQHandler(void) {
         MODBUS_MODE_RX();
 
         // Resume listening
-#if(MODBUS_FREERTOS)
+#ifdef MODBUS_FREERTOS
         xTaskNotifyFromISR(modbus_rtostask, modbus_enable_rx, eSetValueWithOverwrite, &xHigherPriorityTaskWoken);
-        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 #else
         modbus_last_frame_timestamp = timestamp_get();
         modbus_schedule_task(modbus_enable_rx, MODBUS_INTERFRAME_GAP);
 #endif
     }
+#ifdef MODBUS_FREERTOS
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+#endif
 }
 
 void modbus_set_dev_addr(uint8_t addr) {
@@ -191,266 +181,6 @@ void modbus_enable_listening(void) {
     LL_USART_EnableDirectionRx(USART1);
 }
 
-typedef uint8_t (*field_action)(const modbus_reg_map_def_t* cur_reg_range, uint16_t cur_addr, uint16_t i, void* param);
-
-static uint8_t collect_mutex_flag(const modbus_reg_map_def_t* cur_reg_range, uint16_t cur_addr, uint16_t i, void* param) {
-    uint32_t* tx_buf_index = (uint32_t*) param;
-    *tx_buf_index |= (1 << cur_reg_range->reg_mutex_flag_bit);
-    return MODBUS_ERR_NOERR;
-}
-
-static uint8_t process_read(const modbus_reg_map_def_t* cur_reg_range, uint16_t cur_addr, uint16_t i, void* param) {
-    uint16_t* tx_buf_index = (uint16_t*) param;
-    uint8_t error_code = MODBUS_ERR_NOERR;
-    uint16_t reg_val;
-    switch (cur_reg_range->reg_data_type) {
-    case MODBUS_DATATYPE_INT16_GAP:
-        error_code = MODBUS_ERR_ILLEGAL_ADDR;
-        break;
-    case MODBUS_DATATYPE_INT16_DYN:
-        error_code = ((modbus_dyn_reg_func)cur_reg_range->mem)(cur_addr, &reg_val, 0);
-        break;
-    case MODBUS_DATATYPE_INT16:
-        reg_val = ((uint16_t*)(cur_reg_range->mem))[i];
-        break;
-    case MODBUS_DATATYPE_INT32_LH:
-        break;
-    case MODBUS_DATATYPE_INT32_HL:
-        break;
-    default:
-        break;
-    }
-
-    if (error_code == MODBUS_ERR_NOERR) {
-        uart_tx_buf[*tx_buf_index] = (reg_val >> 8) & 0xFF; // Higher byte
-        *tx_buf_index = *tx_buf_index + 1;
-        uart_tx_buf[*tx_buf_index] = reg_val & 0xFF;        // Lower byte
-        *tx_buf_index = *tx_buf_index + 1;
-    }
-
-    return error_code;
-}
-
-static uint8_t process_write(const modbus_reg_map_def_t* cur_reg_range, uint16_t cur_addr, uint16_t i, void* param) {
-    uint16_t* rx_buf_index = (uint16_t*) param;
-    uint8_t error_code = MODBUS_ERR_NOERR;
-    uint16_t reg_val = uart_rx_buf[*rx_buf_index];        // Higher byte
-    reg_val <<= 8;
-    *rx_buf_index = *rx_buf_index + 1;
-    reg_val |= uart_rx_buf[*rx_buf_index];   // Lower byte
-    *rx_buf_index = *rx_buf_index + 1;
-
-    switch (cur_reg_range->reg_data_type) {
-    case MODBUS_DATATYPE_INT16_GAP:
-        error_code = MODBUS_ERR_ILLEGAL_ADDR;
-        break;
-    case MODBUS_DATATYPE_INT16_DYN:
-        error_code = ((modbus_dyn_reg_func)cur_reg_range->mem)(cur_addr, &reg_val, 1);
-        break;
-    case MODBUS_DATATYPE_INT16:
-        ((uint16_t*)(cur_reg_range->mem))[i] = reg_val;
-        break;
-    case MODBUS_DATATYPE_INT32_LH:
-        break;
-    case MODBUS_DATATYPE_INT32_HL:
-        break;
-    default:
-        break;
-    }
-
-    return error_code;
-}
-
-static uint8_t process_iteration(uint16_t start_addr, uint16_t count, void* param, field_action action) {
-    const modbus_reg_map_def_t* reg_def_start = uart_rx_buf[1] == MODBUS_FUNC_READ_INPUT
-            ? modbus_get_input_regdef() : modbus_get_holding_regdef();
-    uint8_t error_code = MODBUS_ERR_NOERR;
-
-    uint16_t cur_range_index = 0;
-    uint16_t cur_range_addr_offset = 0;
-
-    const uint16_t end_addr = start_addr + count;
-    uint16_t cur_addr = start_addr;
-
-    while (cur_addr < end_addr) {
-        modbus_reg_map_def_t const* cur_reg_range = reg_def_start + cur_range_index;
-
-        if (cur_reg_range->reg_count == 0) {
-            // Reached the end marker, out of defined range
-            error_code = MODBUS_ERR_ILLEGAL_ADDR;
-            break;
-        } else if (cur_addr >= cur_range_addr_offset + cur_reg_range->reg_count) {
-            // Skip current range
-            cur_range_addr_offset += cur_reg_range->reg_count;
-            cur_range_index++;
-        } else {
-            uint16_t i = cur_addr - cur_range_addr_offset;
-
-            error_code = action(cur_reg_range, cur_addr, i, param);
-            if (error_code != MODBUS_ERR_NOERR) {
-                break;
-            }
-
-            cur_addr++;
-            if (cur_addr == cur_range_addr_offset + cur_reg_range->reg_count) {
-                // Move to the next range
-                cur_range_addr_offset = cur_addr;
-                cur_range_index++;
-            }
-        }
-    }
-
-    return error_code;
-}
-
-/*
- * Parse the query in uart_rx_buf and generate a response in uart_tx_buf without sending it.
- */
-static void parse_query_packet(void) {
-    // Prepare response
-    // If error_code != MODBUS_ERR_NOERR, then response_len will be ignored
-    uint8_t error_code = MODBUS_ERR_NOERR;
-    uint16_t response_len = 2;
-    uart_tx_buf[0] = uart_rx_buf[0];    // Our device address
-    uart_tx_buf[1] = uart_rx_buf[1];    // Copy function code
-
-    // Parse the query
-    uint32_t mutex_flag;
-    uint16_t reg_addr, reg_num, var16;
-    switch(uart_rx_buf[1]) {
-    case MODBUS_FUNC_READ_REG:          // Read analog output / Read holding registers
-    case MODBUS_FUNC_READ_INPUT:        // Read analog input
-        if (uart_rx_len < 6) {
-            error_code = MODBUS_ERR_ILLEGAL_FUNC;
-            break;
-        }
-
-        reg_addr = uart_rx_buf[2];
-        reg_addr <<= 8;
-        reg_addr |= uart_rx_buf[3];
-
-        reg_num = uart_rx_buf[4];
-        reg_num <<= 8;
-        reg_num |= uart_rx_buf[5];
-
-        if (reg_num > 125) {
-            error_code = MODBUS_ERR_ILLEGAL_FUNC;
-            break;
-        }
-
-#if(MODBUS_FREERTOS)
-        process_iteration(reg_addr, reg_num, &mutex_flag, collect_mutex_flag);
-        modbus_mutex_take(mutex_flag);
-#endif
-        response_len = 3;
-        error_code = process_iteration(reg_addr, reg_num, &response_len, &process_read);
-#if(MODBUS_FREERTOS)
-        modbus_mutex_give(mutex_flag);
-#endif
-
-        // Find out byte number of all fields.
-        uart_tx_buf[2] = (response_len-3);
-        break;
-    case MODBUS_FUNC_WRITE_1REG:        // Set single analog output / Write a holding register
-        if (uart_rx_len < 6) {
-            error_code = MODBUS_ERR_ILLEGAL_FUNC;
-            break;
-        }
-
-        reg_addr = uart_rx_buf[2];
-        reg_addr <<= 8;
-        reg_addr |= uart_rx_buf[3];
-
-#if(MODBUS_FREERTOS)
-        process_iteration(reg_addr, 1, &mutex_flag, collect_mutex_flag);
-        modbus_mutex_take(mutex_flag);
-#endif
-        var16 = 4;
-        error_code = process_iteration(reg_addr, 1, &var16, process_write);
-#if(MODBUS_FREERTOS)
-        modbus_mutex_give(mutex_flag);
-#endif
-
-        if (error_code == MODBUS_ERR_NOERR) {
-            // Address
-            uart_tx_buf[2] = uart_rx_buf[2];
-            uart_tx_buf[3] = uart_rx_buf[3];
-            // Value
-            uart_tx_buf[4] = uart_rx_buf[4];
-            uart_tx_buf[5] = uart_rx_buf[5];
-
-            response_len = 6;
-        } else {
-            response_len = 3;
-        }
-
-        break;
-    case MODBUS_FUNC_WRITE_REGS:        // Set multiple analog output / Write multiple holding registers
-        if (uart_rx_len < 9) {
-            error_code = MODBUS_ERR_ILLEGAL_FUNC;
-            break;
-        }
-
-        reg_addr = uart_rx_buf[2];
-        reg_addr <<= 8;
-        reg_addr |= uart_rx_buf[3];
-
-        reg_num = uart_rx_buf[4];
-        reg_num <<= 8;
-        reg_num |= uart_rx_buf[5];
-
-        // Number of value field
-        var16 = uart_rx_buf[6] >> 1;
-        if (var16 < ((uart_rx_len-7)>>1) || var16 < reg_num) {
-            // We don't have enough value for the operation
-            error_code = MODBUS_ERR_ILLEGAL_VAL;
-            break;
-        }
-
-#if(MODBUS_FREERTOS)
-        process_iteration(reg_addr, reg_num, &mutex_flag, collect_mutex_flag);
-        modbus_mutex_take(mutex_flag);
-#endif
-        var16 = 7;
-        error_code = process_iteration(reg_addr, reg_num, &var16, process_write);
-#if(MODBUS_FREERTOS)
-        modbus_mutex_give(mutex_flag);
-#endif
-
-        if (error_code == MODBUS_ERR_NOERR) {
-            // Address
-            uart_tx_buf[2] = uart_rx_buf[2];
-            uart_tx_buf[3] = uart_rx_buf[3];
-            // Value
-            uart_tx_buf[4] = uart_rx_buf[4];
-            uart_tx_buf[5] = uart_rx_buf[5];
-            // Length
-            response_len = 6;
-        }
-        break;
-    default:
-        error_code = MODBUS_ERR_ILLEGAL_FUNC;
-        break;
-    }
-
-    if (error_code != MODBUS_ERR_NOERR) {
-        uart_tx_buf[1] = uart_rx_buf[1] | 0x80;
-        uart_tx_buf[2] = error_code;
-        response_len = 3;
-    }
-
-    var16 = modbus_crc16((uint8_t*) uart_tx_buf, response_len);
-    uart_tx_buf[response_len] = var16 & 0xFF;       // Lower Byte
-    response_len++;
-    var16>>=8;
-    uart_tx_buf[response_len] = var16 & 0xFF;   // Higher Byte
-    response_len++;
-    uart_tx_len = response_len;
-
-    // Clear previous states
-    uart_rx_len = 0;
-}
-
 static void start_tx(void) {
     MODBUS_MODE_TX();
     LL_USART_ClearFlag_TC(USART1);
@@ -460,7 +190,7 @@ static void start_tx(void) {
     LL_DMA_EnableChannel(DMA1, LL_DMA_CHANNEL_2);
 }
 
-#if(MODBUS_FREERTOS)
+#ifdef MODBUS_FREERTOS
 static void modbus_rtos_task(void *pvParameters) {
     uint32_t event;
 
@@ -477,9 +207,30 @@ static void modbus_rtos_task(void *pvParameters) {
             vTaskDelay(MODBUS_INTERFRAME_GAP_TICKS);
             modbus_enable_listening();
         } else {
-            parse_query_packet();
+            uint16_t crc16_calc = modbus_crc16((uint8_t*) uart_rx_buf, uart_rx_len - 2);
+            uint16_t crc16_recv = uart_rx_buf[uart_rx_len-1];
+            crc16_recv <<= 8;
+            crc16_recv |= uart_rx_buf[uart_rx_len-2];
 
-            if (uart_tx_buf[0] == 0) {
+            // Check CRC
+            if (crc16_calc == crc16_recv) {
+                uart_tx_len = parse_query_packet((const modbus_dev_def_t*)pvParameters, uart_rx_buf, uart_rx_len - 2, uart_tx_buf);
+
+                crc16_calc = modbus_crc16((uint8_t*) uart_tx_buf, uart_tx_len);
+                uart_tx_buf[uart_tx_len] = crc16_calc & 0xFF;   // Lower Byte
+                uart_tx_len++;
+                crc16_calc>>=8;
+                uart_tx_buf[uart_tx_len] = crc16_calc & 0xFF;   // Higher Byte
+                uart_tx_len++;
+            } else {
+                uart_tx_len = 0;
+            }
+
+            // Clear previous states
+            uart_rx_len = 233;
+
+            if (uart_tx_len == 0 || uart_tx_buf[0] == 0) {
+                // Invalid request CRC, or
                 // Broadcasting message, do not send response
                 uart_tx_len = 0;
                 MODBUS_MODE_RX();
@@ -490,7 +241,6 @@ static void modbus_rtos_task(void *pvParameters) {
                 modbus_enable_listening();
             } else {
                 vTaskDelay(MODBUS_INTERFRAME_GAP_TICKS);
-
                 // Ready to send response
                 start_tx();
             }
@@ -501,10 +251,11 @@ static void modbus_rtos_task(void *pvParameters) {
 void modbus_freertos_init(void) {
     static StackType_t stack[MODBUS_STACK_SIZE];
     static StaticTask_t task_buffer;
+    extern modbus_dev_def_t modbus_dev_def;
     modbus_rtostask = xTaskCreateStatic(&modbus_rtos_task,
             "Modbus",
             MODBUS_STACK_SIZE,
-            (void*)0,
+            &modbus_dev_def,
             MODBUS_TASK_PRIORITY,
             stack,
             &task_buffer
@@ -515,6 +266,7 @@ void modbus_freertos_init(void) {
  * Called by main() periodically
  */
 void modbus_task(void) {
+    extern modbus_dev_def_t modbus_dev_def;
     timestamp_t now = timestamp_get();
     if (modbus_next_task != modbus_no_pending && timestamp_reached(modbus_next_timeout_timestamp, now)) {
         // If we have a pending task to execute & it is the time
@@ -531,9 +283,27 @@ void modbus_task(void) {
         return;
 
     // We have a new incoming request
-    parse_query_packet();
+    uint16_t crc16_calc = modbus_crc16((uint8_t*) uart_rx_buf, uart_rx_len - 2);
+    uint16_t crc16_recv = uart_rx_buf[uart_rx_len-1];
+    crc16_recv <<= 8;
+    crc16_recv |= uart_rx_buf[uart_rx_len-2];
 
-    if (uart_tx_buf[0] == 0) {
+    // Check CRC
+    if (crc16_calc == crc16_recv) {
+        uart_tx_len = parse_query_packet((const modbus_dev_def_t*)&modbus_dev_def, uart_rx_buf, uart_rx_len - 2, uart_tx_buf);
+
+        crc16_calc = modbus_crc16((uint8_t*) uart_tx_buf, uart_tx_len);
+        uart_tx_buf[uart_tx_len] = crc16_calc & 0xFF;   // Lower Byte
+        uart_tx_len++;
+        crc16_calc>>=8;
+        uart_tx_buf[uart_tx_len] = crc16_calc & 0xFF;   // Higher Byte
+        uart_tx_len++;
+
+        // Clear previous states
+        uart_rx_len = 0;
+    }
+
+    if (uart_tx_len == 0 || uart_tx_buf[0] == 0) {
         // Broadcasting message, do not send response
         uart_tx_len = 0;
         MODBUS_MODE_RX();
