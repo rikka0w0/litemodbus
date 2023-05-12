@@ -1,6 +1,7 @@
-#include "modbus_stm32_priv.h"
+#include "modbus_config.h"
 
 #ifdef MODBUS_PLATFORM_STM32
+#include "modbus_stm32_priv.h"
 #include "modbus_protocol.h"
 #include "modbus_stm32.h"
 #include "modbus_utils.h"

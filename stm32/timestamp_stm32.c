@@ -1,4 +1,6 @@
 #include "timestamp_stm32.h"
+
+#ifdef MODBUS_PLATFORM_STM32
 #include "modbus_stm32_priv.h"
 
 #ifndef TIMESTAMP_TICK2US
@@ -38,4 +40,4 @@ timestamp_t timestamp_get(void) {
     systick = TIMESTAMP_TICK2US(systick);
     return ((timestamp_t)ms * 1000) + systick;
 }
-
+#endif // #ifdef MODBUS_PLATFORM_STM32
