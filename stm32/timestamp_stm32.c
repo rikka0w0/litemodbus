@@ -28,6 +28,14 @@ void timestamp_config() {
     LL_SYSTICK_EnableIT();
 }
 
+timestamp_t timestamp_schedule(timestamp_t duration, timestamp_t ref) {
+    return (uint32_t)ref + (uint32_t)duration;
+}
+
+bool timestamp_reached(timestamp_t ts, timestamp_t ref) {
+    return (timestamp_t)ts - (timestamp_t)ref < 0x7FFFFFFF;
+}
+
 timestamp_t timestamp_get(void) {
     uint32_t ms, systick;
 
