@@ -197,6 +197,11 @@ static modbus_err_t process_iteration(modbus_cb_context_t* cb_context, uint16_t 
     uint16_t cur_range_index = 0;
     uint16_t cur_range_addr_offset = 0;
 
+    if (first_reg_range == 0) {
+        // That class of registers is not defined at all
+        return MODBUS_ERR_ILLEGAL_FUNC;
+    }
+
     cb_context->end_addr = cb_context->start_addr + count;
     cb_context->reg_addr = cb_context->start_addr;
     
@@ -337,11 +342,17 @@ modbus_size_t parse_query_packet(const modbus_dev_def_t* dev_def, const void* rx
         reg_num = modbus_get_buf_byte(rx_buf, 4);
         reg_num <<= 8;
         reg_num |= modbus_get_buf_byte(rx_buf, 5);
+        if (reg_num == 0 || reg_num > 123) {
+            error_code = MODBUS_ERR_ILLEGAL_VAL;
+            break;
+        }
 
         // Number of value field
-        cb_context.start_addr = modbus_get_buf_byte(rx_buf, 6) >> 1;
-        if (cb_context.start_addr < ((rx_len-7)>>1) || cb_context.start_addr < reg_num) {
-            // We don't have enough value for the operation
+        cb_context.start_addr = modbus_get_buf_byte(rx_buf, 6);
+        if ((cb_context.start_addr & 1)
+                || cb_context.start_addr != (rx_len - 7)
+                || cb_context.start_addr != (uint16_t)(reg_num * 2U)) {
+            // Value field length must be even and match both the frame length and requested register count
             error_code = MODBUS_ERR_ILLEGAL_VAL;
             break;
         }
